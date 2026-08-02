@@ -1,39 +1,34 @@
-﻿import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createAtomicJsonStore } from '../storage/atomicJsonStore.js'
 
 const projectDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
-const historyDir = path.join(projectDir, 'chat-history')
-const historyFile = path.join(historyDir, 'conversations.json')
+const historyStore = createAtomicJsonStore({
+  filePath: path.join(projectDir, 'chat-history', 'conversations.json'),
+  defaultValue: { version: 1, conversations: {} },
+  migrations: { 0: (value) => ({ version: 1, conversations: value || {} }) },
+  validate: (value) => value && value.version === 1 && value.conversations && typeof value.conversations === 'object',
+})
 const maxAgeMs = 14 * 24 * 60 * 60 * 1000
 const maxMessages = 40
 const maxContentLength = 5000
 
-let data = {}
-
-async function load() {
-  try { data = JSON.parse(await readFile(historyFile, 'utf8')) }
-  catch (error) {
-    if (error.code !== 'ENOENT') console.warn('[history] read failed:', error.message)
-    data = {}
-  }
-  prune()
-}
-
-async function save() {
-  await mkdir(historyDir, { recursive: true })
-  await writeFile(historyFile, JSON.stringify(data, null, 2) + '\n', 'utf8')
-}
+let data = (await historyStore.load()).conversations
 
 function prune() {
   const cutoff = Date.now() - maxAgeMs
   for (const id of Object.keys(data)) {
-    data[id] = (data[id] || []).filter((entry) => entry.timestamp > cutoff).slice(-maxMessages)
+    data[id] = (Array.isArray(data[id]) ? data[id] : [])
+      .filter((entry) => Number(entry.timestamp) > cutoff)
+      .slice(-maxMessages)
     if (data[id].length === 0) delete data[id]
   }
 }
 
-await load()
+async function save() {
+  prune()
+  await historyStore.save({ version: 1, conversations: data })
+}
 
 export async function getHistory(conversationId) {
   const id = String(conversationId)
@@ -54,7 +49,6 @@ export async function appendHistory(conversationId, entries) {
 }
 
 export async function clearHistory(conversationId) {
-  const id = String(conversationId)
-  delete data[id]
+  delete data[String(conversationId)]
   await save()
 }

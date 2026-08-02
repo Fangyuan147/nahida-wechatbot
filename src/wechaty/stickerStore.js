@@ -1,19 +1,35 @@
 ﻿import { cp, mkdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { rename } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
+import { createAtomicJsonStore } from '../storage/atomicJsonStore.js'
 
 const projectDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
-const packsDir = path.join(projectDir, 'sticker-packs')
+const packsDir = path.resolve(process.env.STICKER_PACKS_DIR || path.join(projectDir, 'sticker-packs'))
 const pendingDir = path.join(packsDir, '.pending')
 const indexFile = path.join(packsDir, 'index.json')
+const indexStore = createAtomicJsonStore({
+  filePath: indexFile,
+  defaultValue: { version: 1, stickers: {} },
+  migrations: { 0: (value) => ({ version: 1, stickers: value || {} }) },
+  validate: (value) => value && value.version === 1 && value.stickers && typeof value.stickers === 'object',
+})
+const captureStore = createAtomicJsonStore({
+  filePath: path.join(path.resolve(process.env.BOT_STATE_DIR || path.join(projectDir, 'bot-state')), 'sticker-capture.json'),
+  defaultValue: { version: 1, captures: {} },
+  validate: (value) => value && typeof value === 'object' && value.captures && typeof value.captures === 'object',
+})
 
 // captureState: conversationId -> { remaining: number } | 'asking_count'
 const captureStateMap = new Map()
-const pendingTtlMs = 10 * 60 * 1000
+export const captureTimeoutMs = 60 * 1000
+const captureTimers = new Map()
+const captureTimeouts = new Map()
 
 let dirsReady = false
 let indexCache = null
 let indexCacheTime = 0
+let captureData = (await captureStore.load()).captures
 
 async function ensureDirs() {
   if (dirsReady) return
@@ -23,32 +39,72 @@ async function ensureDirs() {
 
 async function loadIndex() {
   if (indexCache && Date.now() - indexCacheTime < 30000) return indexCache
-  try {
-    indexCache = JSON.parse(await readFile(indexFile, 'utf8'))
-    indexCacheTime = Date.now()
-    return indexCache
-  } catch (error) {
-    if (error.code === 'ENOENT') { indexCache = {}; return indexCache }
-    console.warn('[sticker] index read failed:', error.message)
-    return indexCache || {}
-  }
+  const stored = await indexStore.load()
+  indexCache = stored.stickers || stored
+  indexCacheTime = Date.now()
+  return indexCache
 }
 
 async function saveIndex(indexData) {
   indexCache = indexData
   indexCacheTime = Date.now()
-  await writeFile(indexFile, JSON.stringify(indexData, null, 2) + '\n', 'utf8')
+  await indexStore.save({ version: 1, stickers: indexData })
+}
+
+function persistCaptureState(conversationId) {
+  const key = String(conversationId)
+  const value = captureStateMap.get(key)
+  if (value) captureData[key] = { value, expiresAt: Date.now() + (captureTimeouts.get(key) || captureTimeoutMs) }
+  else delete captureData[key]
+  captureStore.save({ version: 1, captures: captureData }).catch((error) => console.warn('[sticker] capture state save failed:', error.message))
 }
 
 // ── capture state machine ──
 
-export function startCaptureFlow(conversationId) {
-  captureStateMap.set(String(conversationId), 'asking_count')
+function clearCaptureTimer(conversationId) {
+  const key = String(conversationId)
+  const timer = captureTimers.get(key)
+  if (timer) clearTimeout(timer)
+  captureTimers.delete(key)
 }
 
-export function setCaptureCount(conversationId, count) {
+function scheduleCaptureExpiry(conversationId, timeoutMs = captureTimeoutMs) {
+  const key = String(conversationId)
+  clearCaptureTimer(key)
+  captureTimeouts.set(key, timeoutMs)
+  captureTimers.set(key, setTimeout(() => {
+    if (!captureStateMap.has(key)) return
+    captureStateMap.delete(key)
+    captureTimeouts.delete(key)
+    captureTimers.delete(key)
+    persistCaptureState(key)
+    console.log('[sticker] capture expired after 60s: ' + key)
+  }, timeoutMs))
+}
+
+for (const [conversationId, persisted] of Object.entries(captureData)) {
+  if (!persisted || persisted.expiresAt <= Date.now()) {
+    delete captureData[conversationId]
+    continue
+  }
+  captureStateMap.set(conversationId, persisted.value)
+  scheduleCaptureExpiry(conversationId, Math.max(1, persisted.expiresAt - Date.now()))
+}
+captureStore.save({ version: 1, captures: captureData }).catch((error) => console.warn('[sticker] capture state cleanup failed:', error.message))
+
+export function startCaptureFlow(conversationId, timeoutMs = captureTimeoutMs) {
+  const key = String(conversationId)
+  captureStateMap.set(key, 'asking_count')
+  scheduleCaptureExpiry(key, timeoutMs)
+  persistCaptureState(key)
+}
+
+export function setCaptureCount(conversationId, count, timeoutMs = captureTimeouts.get(String(conversationId)) || captureTimeoutMs) {
+  const key = String(conversationId)
   const n = Math.max(1, Math.min(Number(count) || 1, 20))
-  captureStateMap.set(String(conversationId), { remaining: n, total: n })
+  captureStateMap.set(key, { remaining: n, total: n })
+  scheduleCaptureExpiry(key, timeoutMs)
+  persistCaptureState(key)
   return n
 }
 
@@ -64,13 +120,22 @@ export function consumeOneCaptureSlot(conversationId) {
   state.remaining -= 1
   if (state.remaining <= 0) {
     captureStateMap.delete(key)
+    clearCaptureTimer(key)
+    captureTimeouts.delete(key)
+    persistCaptureState(key)
     return state.total  // last one — return total for the "done" message
   }
+  scheduleCaptureExpiry(key, captureTimeouts.get(key) || captureTimeoutMs)
+  persistCaptureState(key)
   return state.remaining + 1  // return how many left INCLUDING this one
 }
 
 export function cancelCapture(conversationId) {
-  captureStateMap.delete(String(conversationId))
+  const key = String(conversationId)
+  captureStateMap.delete(key)
+  clearCaptureTimer(key)
+  captureTimeouts.delete(key)
+  persistCaptureState(key)
 }
 
 // ── save / archive ──
@@ -148,12 +213,19 @@ export async function archivePendingSticker(conversationId, tags = []) {
   const filename = 'sticker_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8) + ext
   const targetPath = path.join(packsDir, filename)
 
-  await cp(pendingPath, targetPath)
-  await rm(pendingPath, { force: true })
+  const stagingPath = targetPath + '.tmp'
+  await cp(pendingPath, stagingPath)
+  await rename(stagingPath, targetPath)
 
   const index = await loadIndex()
   index[filename] = { created: Date.now(), tags: Array.isArray(tags) ? tags : [], conversationId }
-  await saveIndex(index)
+  try {
+    await saveIndex(index)
+  } catch (error) {
+    await unlink(targetPath).catch(() => {})
+    throw error
+  }
+  await rm(pendingPath, { force: true })
   console.log('[sticker] archived: ' + filename)
   return filename
 }
@@ -192,13 +264,15 @@ export async function randomSticker({ emotion = '', prompt = '' } = {}) {
 
   const index = await loadIndex()
   const emotionTags = {
-    affectionate: ['撒娇', '贴贴', '抱抱', '亲亲', '黏人', '可爱', '爱心', '喜欢'],
-    spoiled: ['撒娇', '卖萌', '可爱', '委屈', '求求', '拜托'],
-    happy: ['开心', '笑', '庆祝', '加油', '嗨', '耶'],
-    sad: ['难过', '哭', '委屈', '伤心'],
-    angry: ['生气', '怒', '凶', '不理你'],
+    affectionate: ['撒娇', '贴贴', '抱抱', '亲亲', '黏人', '可爱', '爱心', '喜欢', '亲密'],
+    spoiled: ['撒娇', '卖萌', '可爱', '委屈', '求求', '拜托', '傲娇'],
+    happy: ['开心', '笑', '庆祝', '加油', '嗨', '耶', '鼓励', '欢迎', '感谢', '奖励'],
+    sad: ['难过', '哭', '委屈', '伤心', '安慰'],
+    angry: ['生气', '怒', '凶', '不理你', '哼', '傲娇'],
     shy: ['害羞', '脸红', '不好意思'],
-    surprised: ['惊讶', '震惊', '吓', '愣'],
+    surprised: ['惊讶', '震惊', '吓', '愣', '疑惑', '好奇'],
+    sleepy: ['困', '晚安', '卖萌', '可爱'],
+    jealous: ['吃醋', '生气', '哼', '傲娇', '不理你'],
   }
 
   let candidates = validFiles
@@ -208,7 +282,9 @@ export async function randomSticker({ emotion = '', prompt = '' } = {}) {
       const entry = index[name]
       return entry?.tags?.length ? entry.tags.some((t) => tags.includes(t)) : false
     })
-    if (matched.length > 0) candidates = matched
+    // A mismatched sticker is worse than sending no sticker; never fall back to the full library.
+    if (matched.length === 0) return null
+    candidates = matched
   }
 
   const filename = candidates[Math.floor(Math.random() * candidates.length)]

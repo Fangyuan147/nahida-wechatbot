@@ -28,7 +28,9 @@ export async function searchWithEdge(query) {
 
   return new Promise((resolve, reject) => {
     const child = spawn(edgePath, [
-      '--headless=new',
+      // The installed Edge returns an empty DOM with headless=new; legacy headless
+      // still renders Bing's result page for the bot's isolated search profile.
+      '--headless',
       '--disable-gpu',
       '--no-sandbox',
       '--disable-extensions',

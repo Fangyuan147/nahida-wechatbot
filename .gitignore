@@ -1,24 +1,16 @@
-# API keys and local configuration
-.env
+﻿.env
+.env.local
 .env.*
 !.env.example
-config.local.*
 *.key
-
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-env/
-
-# Logs and temporary files
-*.log
-tmp/
-temp/
-
-# Editor and OS files
-.vscode/
-.idea/
+*.pem
+node_modules/
+chat-history/
+bot-state/
+sticker-packs/
+WechatEveryDay.memory-card.json
+WechatEveryDay.memory-card.json.*
+wechat-bot.memory-card.json
+wechat-bot.memory-card.json.*
 .DS_Store
-Thumbs.db
+Thumbs.

@@ -1,13 +1,5 @@
-﻿import { getGptReply } from '../openai/index.js'
-import { getKimiReply } from '../kimi/index.js'
-
-const serveMap = {
-  GPT: getGptReply,
-  Kimi: getKimiReply,
-  ChatGPT: getGptReply,
-}
+import { callAiProvider } from '../ai/providers/index.js'
 
 export function getServe(serviceType) {
-  const fn = serveMap[serviceType] || serveMap.Kimi
-  return async (prompt, history) => fn(prompt, history)
+  return async (prompt, history) => callAiProvider(serviceType, prompt, history)
 }

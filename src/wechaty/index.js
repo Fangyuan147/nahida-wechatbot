@@ -1,46 +1,15 @@
 ﻿import { WechatyBuilder, ScanStatus, log } from 'wechaty'
 import qrTerminal from 'qrcode-terminal'
-import { defaultMessage } from './sendMessage.js'
-import dotenv from 'dotenv'
+import { defaultMessage, recoverDelayedReplies } from '../message/messageHandler.js'
+import { canReply } from '../security/accessPolicy.js'
+import { getMessageContext } from '../message/conversationContext.js'
 import fs from 'node:fs'
 import path from 'node:path'
 import { rememberPrivateUser, startMorningReminder } from './morningReminder.js'
 import PuppetWechat4u from 'wechaty-puppet-wechat4u'
-const env = { ...process.env, ...(dotenv.config().parsed || {}) }
-let contactLookupWarningShown = false
-
-function disableUnreliableContactLookup() {
-  const prototype = PuppetWechat4u.prototype
-  if (prototype.__safeContactLookupPatched) return
-  prototype.getContactsInfo = function getContactsInfoSafely() {
-    const dropped = Array.isArray(this.unknownContactId) ? this.unknownContactId.splice(0, 40).length : 0
-    if (dropped) console.warn('[wechaty] skipped ' + dropped + ' unreliable contact lookup request(s)')
-  }
-  const originalMonkeyPatch = prototype.monkeyPatch
-  prototype.monkeyPatch = function safeMonkeyPatch(wechat4u) {
-    originalMonkeyPatch.call(this, wechat4u)
-    if (!wechat4u || typeof wechat4u.batchGetContact !== 'function' || wechat4u.__safeBatchGetContactPatched) return
-    const originalBatchGetContact = wechat4u.batchGetContact.bind(wechat4u)
-    wechat4u.batchGetContact = async (contacts) => {
-      try { return await originalBatchGetContact(contacts) }
-      catch (error) {
-        if (String(error?.message || error).includes('-1 == 0')) {
-          if (!contactLookupWarningShown) {
-            console.warn('[wechaty] background contact lookup rejected; continuing without it')
-            contactLookupWarningShown = true
-          }
-          return []
-        }
-        throw error
-      }
-    }
-    Object.defineProperty(wechat4u, '__safeBatchGetContactPatched', { value: true })
-  }
-  Object.defineProperty(prototype, '__safeContactLookupPatched', { value: true })
-}
-disableUnreliableContactLookup()
-
-const memoryCardPath = path.resolve('WechatEveryDay.memory-card.json')
+import { formatProcessError, isRecoverableWechat4uError } from './wechat4uCompatibility.js'
+const env = process.env
+const memoryCardPath = path.resolve(env.MEMORY_CARD_PATH || 'WechatEveryDay.memory-card.json')
 if (fs.existsSync(memoryCardPath)) {
   console.log('[login] existing session cache found (' + fs.statSync(memoryCardPath).size + ' bytes); attempting reuse')
 } else {
@@ -50,8 +19,8 @@ if (fs.existsSync(memoryCardPath)) {
 function onScan(qrcode, status) {
   if (status === ScanStatus.Waiting || status === ScanStatus.Timeout) {
     qrTerminal.generate(qrcode, { small: true })
-    const qrcodeImageUrl = ['https://api.qrserver.com/v1/create-qr-code/?data=', encodeURIComponent(qrcode)].join('')
-    console.log('onScan:', qrcodeImageUrl, ScanStatus[status], status)
+    // Keep the login credential local: never send or print the QR payload.
+    console.log('[login] QR code displayed in the terminal:', ScanStatus[status], status)
   } else {
     log.info('onScan: %s(%s)', ScanStatus[status], status)
   }
@@ -71,7 +40,12 @@ async function onMessage(msg) {
   if (msg.self()) return
   try {
     const talker = msg.talker()
-    if (talker) await rememberPrivateUser(talker)
+    const context = getMessageContext(msg, bot)
+    if (!canReply(context)) {
+      console.log('[message] ignored message rejected by access policy: ' + (context.talkerId || 'unknown'))
+      return
+    }
+    if (talker && !context.isRoom) await rememberPrivateUser(talker)
     await defaultMessage(msg, bot, 'Kimi')
   } catch (error) {
     console.error('[message] failed:', error?.stack || error)
@@ -86,14 +60,22 @@ function onFriendship(friendship) {
   console.log('[friendship] received from ' + (friendship.contact()?.name() || 'unknown'))
 }
 
-process.on('uncaughtException', (error) => {
-  const msg = String(error?.message || error)
-  if (msg.includes("1101' == 0") || msg.includes("1102' == 0") || msg.includes("'-1' == 0") || msg.includes('PuppetWechat4u')) {
-    console.warn('[wechaty] suppressed assert from legacy puppet:', msg.substring(0, 120))
+let reconnectAfterError
+
+function handleProcessError(kind, error) {
+  const details = formatProcessError(error)
+  if (isRecoverableWechat4uError(error)) {
+    console.warn('[wechaty] known WeChat4u compatibility error (' + kind + '), keeping session alive: ' + details)
+    if (reconnectAfterError) reconnectAfterError(error)
     return
   }
-  console.error('uncaughtException', error?.stack || error)
-})
+  console.error('[wechaty] fatal ' + kind + '; stopping for process-manager restart:', details)
+  process.exitCode = 1
+  setTimeout(() => process.exit(1), 0).unref()
+}
+
+process.on('uncaughtException', (error) => handleProcessError('uncaught exception', error))
+process.on('unhandledRejection', (reason) => handleProcessError('unhandled rejection', reason))
 
 const serviceType = 'Kimi'
 const puppet = new PuppetWechat4u()
@@ -106,15 +88,39 @@ bot.on('message', onMessage)
 bot.on('error', onError)
 bot.on('friendship', onFriendship)
 
+let reconnecting = false
+reconnectAfterError = async function reconnectAfterErrorImpl(error) {
+  if (reconnecting) return
+  reconnecting = true
+  try {
+    console.error('[wechaty] connection error; attempting logout/reconnect:', error?.stack || error)
+    await bot.logout().catch(() => {})
+    await bot.start()
+  } catch (reconnectError) {
+    console.error('[wechaty] reconnect failed:', reconnectError?.stack || reconnectError)
+  } finally {
+    reconnecting = false
+  }
+}
+
+bot.on('error', (error) => {
+  const message = formatProcessError(error)
+  if (isRecoverableWechat4uError(error) || /connection|socket|login|logout|puppet|wechat4u/i.test(message)) {
+    reconnectAfterError(error)
+  }
+})
+
 if (!env.KIMI_API_KEY) {
   console.error('[boot] KIMI_API_KEY not found in .env; the bot cannot reply without it')
 }
 
 bot.start()
-  .then(() => {
+  .then(async () => {
     console.log('[boot] Wechaty started with puppet ' + puppet.constructor.name + ', serviceType=' + serviceType)
-    startMorningReminder(bot)
+    await recoverDelayedReplies(bot, serviceType)
+    await startMorningReminder(bot)
   })
   .catch((error) => {
     console.error('[boot] start failed:', error?.stack || error)
+    process.exitCode = 1
   })

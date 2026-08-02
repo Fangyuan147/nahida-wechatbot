@@ -127,8 +127,14 @@ export function detectActionReply(text = '') {
   return action.replies[Math.floor(Math.random() * action.replies.length)]
 }
 
+const actionOnlyPattern = /^(?:\u6478\u6478\u5934|\u6478\u5934|\u63c9\u63c9\u5934|\u6478\u4e00\u6478\u5934|\u62b1\u62b1|\u62b1\u4e00\u4e2a|\u62b1\u4f4f\u4f60|\u62b1\u7d27|\u4eb2\u4eb2|\u4eb2\u4e00\u4e2a|\u4eb2\u4e00\u53e3|\u5565\u5565|\u63c9\u63c9\u8138|\u634f\u634f\u8138|\u634f\u8138|\u6478\u6478\u8138|\u62cd\u62cd|\u62cd\u4e00\u62cd|\u8e6d\u8e6d|\u8e6d\u4e00\u8e6d|\u8d34\u8d34)[\u3002\uff01\uff1f!?]*$/u
+
+export function isActionOnlyRequest(text = '') {
+  return actionOnlyPattern.test(String(text).trim())
+}
+
 export function extractEmotion(text = '') {
-  const match = String(text).match(/\[\[EMOTION:\s*(surprised|angry|spoiled|happy|shy|sad|jealous|sleepy|affectionate)\s*\]\]/iu)
+  const match = String(text).match(/(?:\[\[|\u3010)\s*(?:EMOTION\s*:\s*)?(surprised|angry|spoiled|happy|shy|sad|jealous|sleepy|affectionate)\s*(?:\]\]|\u3011)/iu)
   return match ? match[1].toLowerCase() : null
 }
 
@@ -141,7 +147,7 @@ export function getEmotionAction(emotion) {
 
 export function removeEmotionMarkers(text = '') {
   return String(text)
-    .replace(/(?:\[\[|\u3010)\s*EMOTION\s*:\s*(?:surprised|angry|spoiled|happy|shy|sad|jealous|sleepy|affectionate)\s*(?:\]\]|\u3011)/giu, '')
+    .replace(/(?:\[\[|\u3010)\s*(?:EMOTION\s*:\s*)?(?:surprised|angry|spoiled|happy|shy|sad|jealous|sleepy|affectionate)\s*(?:\]\]|\u3011)/giu, '')
     .trim()
 }
 
